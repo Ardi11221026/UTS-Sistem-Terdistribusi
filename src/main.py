@@ -1,0 +1,111 @@
+import os
+import time
+import asyncio
+import logging
+import json
+import threading
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from typing import List
+
+from .models import Event
+from .dedup_store import DedupStore
+from .consumer import Consumer
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("app")
+
+
+def create_app(db_path: str = None):
+    db_path = db_path or os.environ.get("DEDUP_DB", "./data/dedup.db")
+    dedup = DedupStore(db_path)
+    q: asyncio.Queue = asyncio.Queue()
+    stats = {
+        "received": 0,
+        "unique_processed": 0,
+        "duplicate_dropped": 0,
+        "topics": set(),
+        "start_time": time.time(),
+    }
+
+    consumer = Consumer(q, dedup, stats)
+
+    # 🌀 Gunakan lifespan untuk menangani startup/shutdown
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Startup
+        def run_consumer_in_thread():
+            asyncio.run(consumer.start())
+
+        thread = threading.Thread(target=run_consumer_in_thread, daemon=True)
+        thread.start()
+        logger.info("✅ Background consumer thread started")
+
+        yield  # ⬅️ app jalan di antara ini
+
+        # Shutdown
+        await consumer.stop()
+        dedup.close()
+        logger.info("🔻 Consumer stopped and DB closed")
+
+    # Buat app dengan lifespan (bukan on_event)
+    app = FastAPI(title="UTS Pub-Sub Aggregator", lifespan=lifespan)
+
+    @app.post("/publish")
+    async def publish(request: Request):
+        body = await request.json()
+        events = body if isinstance(body, list) else [body]
+        validated = []
+        for e in events:
+            try:
+                ev = Event(**e)
+                validated.append(ev.model_dump())  # Pydantic v2 safe
+            except Exception as ex:
+                raise HTTPException(
+                    status_code=422, detail=f"Invalid event schema: {ex}"
+                )
+
+        for ev in validated:
+            stats["received"] += 1
+            stats["topics"].add(ev["topic"])
+            await q.put(ev)
+        return JSONResponse({"accepted": len(validated)})
+
+    @app.get("/events")
+    async def get_events(topic: str = None):
+        rows = dedup.list_events(topic)
+        result = []
+        for r in rows:
+            result.append(
+                {
+                    "topic": r[0],
+                    "event_id": r[1],
+                    "timestamp": r[2],
+                    "source": r[3],
+                    "payload": json.loads(r[4] or "{}"),
+                }
+            )
+        return result
+
+    @app.get("/stats")
+    async def get_stats():
+        return {
+            "received": stats["received"],
+            "unique_processed": stats["unique_processed"],
+            "duplicate_dropped": stats["duplicate_dropped"],
+            "topics": list(stats["topics"]),
+            "uptime_seconds": int(time.time() - stats["start_time"]),
+        }
+
+    return app
+
+
+# ✅ Global instance for uvicorn
+app = create_app()
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("src.main:app", host="0.0.0.0", port=8080, reload=True)
